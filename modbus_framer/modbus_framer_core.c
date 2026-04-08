@@ -37,6 +37,10 @@
 #include <sys/ioctl.h>
 #include <time.h>
 
+#ifndef MB_IO_THREAD_STACK_SIZE
+#define MB_IO_THREAD_STACK_SIZE (256u * 1024u)
+#endif
+
 #ifdef __linux__
 #include <linux/serial.h>
 #endif
@@ -702,6 +706,32 @@ static void *io_thread_main(void *arg) {
 }
 
 // ------------------------ 对外 API：提交请求/等待/常用读写封装 ------------------------
+static int mb_create_io_thread(mb_ctx_t *ctx) {
+	pthread_attr_t attr;
+	bool attr_inited = false;
+	pthread_attr_t *attr_ptr = NULL;
+	const size_t page_size = 4096u;
+	size_t stack_size = MB_IO_THREAD_STACK_SIZE;
+	int rc = pthread_attr_init(&attr);
+	if (rc == 0) {
+		attr_inited = true;
+		if (stack_size < PTHREAD_STACK_MIN) stack_size = PTHREAD_STACK_MIN;
+		stack_size = ((stack_size + page_size - 1u) / page_size) * page_size;
+		rc = pthread_attr_setstacksize(&attr, stack_size);
+		if (rc == 0) {
+			attr_ptr = &attr;
+		} else {
+			LOGW("io thread stack size fallback to default: %s", strerror(rc));
+		}
+	} else {
+		LOGW("io thread attr init failed: %s", strerror(rc));
+	}
+
+	rc = pthread_create(&ctx->th, attr_ptr, io_thread_main, ctx);
+	if (attr_inited) pthread_attr_destroy(&attr);
+	return rc;
+}
+
 int mb_ctx_init(mb_ctx_t *ctx, mb_line_cfg_t line) {
 	/*
 	 * 初始化主站上下文：
@@ -726,7 +756,7 @@ int mb_ctx_init(mb_ctx_t *ctx, mb_line_cfg_t line) {
 	ctx->running = true;
 	ctx->last_bus_activity_us = now_us();
 
-	rc = pthread_create(&ctx->th, NULL, io_thread_main, ctx);
+	rc = mb_create_io_thread(ctx);
 	if (rc != 0) {
 		LOGE("%s", "pthread_create failed");
 		mb_close_modbus(ctx);

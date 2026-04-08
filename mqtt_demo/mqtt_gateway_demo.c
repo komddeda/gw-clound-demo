@@ -16,6 +16,10 @@
 
 volatile sig_atomic_t g_running = 1;
 
+#ifndef APP_THREAD_STACK_SIZE
+#define APP_THREAD_STACK_SIZE (256u * 1024u)
+#endif
+
 static void on_signal(int sig) {
     (void)sig;
     g_running = 0;
@@ -402,6 +406,37 @@ void build_topics(app_t *app) {
              "gateway/%s/test/down", app->cfg.device_id);
 }
 
+static int create_app_thread(pthread_t *thread,
+                             void *(*entry)(void *),
+                             void *arg,
+                             const char *name) {
+    if (!thread || !entry) return -1;
+
+    pthread_attr_t attr;
+    bool attr_inited = false;
+    pthread_attr_t *attr_ptr = NULL;
+    size_t stack_size = APP_THREAD_STACK_SIZE;
+    const size_t page_size = 4096u;
+    int rc = pthread_attr_init(&attr);
+    if (rc == 0) {
+        attr_inited = true;
+        if (stack_size < PTHREAD_STACK_MIN) stack_size = PTHREAD_STACK_MIN;
+        stack_size = ((stack_size + page_size - 1u) / page_size) * page_size;
+        rc = pthread_attr_setstacksize(&attr, stack_size);
+        if (rc == 0) {
+            attr_ptr = &attr;
+        } else {
+            LOGW("%s thread stack size fallback to default: %s", name ? name : "worker", strerror(rc));
+        }
+    } else {
+        LOGW("%s thread attr init failed: %s", name ? name : "worker", strerror(rc));
+    }
+
+    rc = pthread_create(thread, attr_ptr, entry, arg);
+    if (attr_inited) pthread_attr_destroy(&attr);
+    return rc;
+}
+
 static void usage(const char *argv0) {
     fprintf(stderr,
             "Usage: %s [options]\n"
@@ -668,7 +703,7 @@ int main(int argc, char **argv) {
     MQTTClient_setCallbacks(app.mqtt, &app, mqtt_connection_lost, mqtt_message_arrived, mqtt_delivery_complete);
 
     bool telemetry_started = false;
-    if (pthread_create(&app.telemetry_thread, NULL, telemetry_publisher_main, &app) != 0) {
+    if (create_app_thread(&app.telemetry_thread, telemetry_publisher_main, &app, "telemetry") != 0) {
         LOGE("telemetry thread create failed");
         MQTTClient_destroy(&app.mqtt);
         pthread_mutex_destroy(&app.mqtt_lock);
@@ -681,7 +716,7 @@ int main(int argc, char **argv) {
 
     bool test_started = false;
     if (app.cfg.test_mode_enable) {
-        if (pthread_create(&app.test_thread, NULL, test_publisher_main, &app) != 0) {
+        if (create_app_thread(&app.test_thread, test_publisher_main, &app, "test") != 0) {
             LOGE("test publisher thread create failed");
             g_running = 0;
             if (telemetry_started) pthread_join(app.telemetry_thread, NULL);
@@ -696,7 +731,7 @@ int main(int argc, char **argv) {
 
     bool tail_started = false;
     if (app.cfg.tail_enable) {
-        if (pthread_create(&app.tail_thread, NULL, file_tailer_main, &app) != 0) {
+        if (create_app_thread(&app.tail_thread, file_tailer_main, &app, "tailer") != 0) {
             LOGE("file tailer thread create failed");
             g_running = 0;
             if (telemetry_started) pthread_join(app.telemetry_thread, NULL);

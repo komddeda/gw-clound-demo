@@ -18,6 +18,10 @@
 
 #include "mqtt_gateway_app.h"
 
+#ifndef TELEMETRY_CTRL_FILE_BUFFER_SIZE
+#define TELEMETRY_CTRL_FILE_BUFFER_SIZE 4096
+#endif
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
@@ -554,18 +558,17 @@ static void reload_ctrl_overrides(
         return;
     }
 
-    char *buf = (char *)malloc((size_t)size + 1u);
-    if (!buf) {
-        fclose(fp);
-        return;
+    size_t to_read = (size_t)size;
+    if (to_read >= TELEMETRY_CTRL_FILE_BUFFER_SIZE) {
+        to_read = TELEMETRY_CTRL_FILE_BUFFER_SIZE - 1u;
     }
 
-    size_t rd = fread(buf, 1, (size_t)size, fp);
+    char buf[TELEMETRY_CTRL_FILE_BUFFER_SIZE];
+    size_t rd = fread(buf, 1, to_read, fp);
     fclose(fp);
     buf[rd] = '\0';
 
     cJSON *root = cJSON_Parse(buf);
-    free(buf);
     if (!root || !cJSON_IsObject(root)) {
         if (root) cJSON_Delete(root);
         return;

@@ -28,6 +28,10 @@
  * - A file is considered complete when a newer file exists (or idle long enough if it's the only file).
  */
 
+#ifndef TAILER_LINE_BUFFER_SHRINK_THRESHOLD
+#define TAILER_LINE_BUFFER_SHRINK_THRESHOLD (128u * 1024u)
+#endif
+
 static const char *k_done_file_name = "mqtt_upload.log";
 static const char *k_legacy_done_file_name = ".sent_files";
 
@@ -261,6 +265,14 @@ static int cmp_str_ptr(const void *a, const void *b) {
     return strcmp(sb, sa);
 }
 
+static void release_large_line_buffer(char **line, size_t *line_cap) {
+    if (!line || !line_cap || !*line) return;
+    if (*line_cap <= TAILER_LINE_BUFFER_SHRINK_THRESHOLD) return;
+    free(*line);
+    *line = NULL;
+    *line_cap = 0;
+}
+
 static void upsert_json_string(cJSON *root, const char *key, const char *value) {
     if (!root || !cJSON_IsObject(root) || !key || !*key || !value || !*value) return;
     cJSON_DeleteItemFromObjectCaseSensitive(root, key);
@@ -367,6 +379,7 @@ void *file_tailer_main(void *arg) {
                     LOGW("tailer cannot open dir: %s", cfg.data_dir);
                     last_dir_warn = now;
                 }
+                release_large_line_buffer(&line, &line_cap);
                 str_list_free(&files);
                 sleep_ms(cfg.tail_poll_ms);
                 continue;
@@ -377,6 +390,7 @@ void *file_tailer_main(void *arg) {
                     LOGD("tailer idle: no stable files in %s", cfg.data_dir);
                     last_dir_warn = now;
                 }
+                release_large_line_buffer(&line, &line_cap);
                 str_list_free(&files);
                 sleep_ms(cfg.tail_poll_ms);
                 continue;
@@ -384,6 +398,7 @@ void *file_tailer_main(void *arg) {
             qsort(files.items, files.count, sizeof(char *), cmp_str_ptr);
             if (tail_file_open(&cur, cfg.data_dir, files.items[0]) != 0) {
                 LOGD("tailer open failed: %s", files.items[0]);
+                release_large_line_buffer(&line, &line_cap);
                 str_list_free(&files);
                 sleep_ms(cfg.tail_poll_ms);
                 continue;
@@ -398,6 +413,7 @@ void *file_tailer_main(void *arg) {
         if (stat(cur.path, &st) != 0) {
             LOGW("tailer stat failed: %s", cur.path);
             tail_file_close(&cur);
+            release_large_line_buffer(&line, &line_cap);
             sleep_ms(cfg.tail_poll_ms);
             continue;
         }
@@ -419,6 +435,7 @@ void *file_tailer_main(void *arg) {
         if (fseeko(cur.fp, cur.offset, SEEK_SET) != 0) {
             LOGW("tailer seek failed: %s", cur.path);
             tail_file_close(&cur);
+            release_large_line_buffer(&line, &line_cap);
             sleep_ms(cfg.tail_poll_ms);
             continue;
         }
@@ -472,6 +489,7 @@ void *file_tailer_main(void *arg) {
 
         if (publish_blocked) {
             LOGD("tailer publish blocked (rc=%d), will retry", last_pub_rc);
+            release_large_line_buffer(&line, &line_cap);
             sleep_ms(cfg.tail_poll_ms);
             continue;
         }
@@ -489,6 +507,7 @@ void *file_tailer_main(void *arg) {
                 }
             }
             tail_file_close(&cur);
+            release_large_line_buffer(&line, &line_cap);
         }
 
         sleep_ms(cfg.tail_poll_ms);

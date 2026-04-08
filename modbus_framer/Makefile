@@ -4,9 +4,11 @@ SYSROOT       := /work/yx_prj/rk3506/rk3506_linux6.1_sdk/buildroot/output/rockch
 CC      := $(CROSS_COMPILE)gcc
 CFLAGS  := --sysroot=$(SYSROOT) \
            -I$(SYSROOT)/usr/include \
-           -O2 -Wall
+           -Os -Wall \
+           -ffunction-sections -fdata-sections
 LDFLAGS := --sysroot=$(SYSROOT) \
            -L$(SYSROOT)/usr/lib \
+           -Wl,--gc-sections \
            -lmodbus
 
 SRCS := modbus_framer_cli.c modbus_framer_core.c

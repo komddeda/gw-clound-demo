@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include <curl/curl.h>
 #include <dirent.h>
 #include <errno.h>
@@ -75,6 +76,9 @@ static void log_write(const char *level, const char *fmt, ...) {
 #endif
 #ifndef STABLE_AGE_S
 #define STABLE_AGE_S 3
+#endif
+#ifndef HTTP_STREAM_LINE_BUFFER_SHRINK_THRESHOLD
+#define HTTP_STREAM_LINE_BUFFER_SHRINK_THRESHOLD (128u * 1024u)
 #endif
 
 typedef enum {
@@ -838,75 +842,103 @@ static bool is_file_stable(const cfg_t *cfg, const file_item_t *item, time_t now
 	return (now - item->write_mtime) >= cfg->stable_age_s;
 }
 
-static upload_result_t upload_json_lines(const cfg_t *cfg, const char *file_buf, size_t len) {
-	size_t start = 0;
-	size_t sent = 0;
-	for (size_t i = 0; i <= len; i++) {
-		if (i == len || file_buf[i] == '\n') {
-			size_t line_start = start;
-			size_t line_len = i - start;
+static void release_large_line_buffer(char **line, size_t *line_cap) {
+	if (!line || !line_cap || !*line) return;
+	if (*line_cap <= HTTP_STREAM_LINE_BUFFER_SHRINK_THRESHOLD) return;
+	free(*line);
+	*line = NULL;
+	*line_cap = 0;
+}
 
-			while (line_len > 0 && (file_buf[line_start] == ' ' || file_buf[line_start] == '\t')) {
-				line_start++;
-				line_len--;
-			}
-			while (line_len > 0) {
-				char c = file_buf[line_start + line_len - 1];
-				if (c == '\r' || c == ' ' || c == '\t') {
-					line_len--;
-				} else {
-					break;
-				}
-			}
+static upload_result_t upload_json_line(const cfg_t *cfg, const char *line, size_t line_len) {
+	if (!cfg || !line || line_len == 0) return UPLOAD_OK;
 
-			if (line_len > 0) {
-				cJSON *item = cJSON_ParseWithLength(file_buf + line_start, line_len);
-				if (!item) return UPLOAD_BAD;
+	cJSON *item = cJSON_ParseWithLength(line, line_len);
+	if (!item) return UPLOAD_BAD;
 
-				const char *payload = file_buf + line_start;
-				size_t payload_len = line_len;
-				char *owned_payload = NULL;
-				if (cJSON_IsObject(item)) {
-					bool modified = false;
-					if (cfg->device_id && cfg->device_id[0] != '\0' &&
-						!cJSON_GetObjectItemCaseSensitive(item, "device_id")) {
-						if (!cJSON_AddStringToObject(item, "device_id", cfg->device_id)) {
-							cJSON_Delete(item);
-							return UPLOAD_RETRY;
-						}
-						modified = true;
-					}
-					if (cfg->cpuinfo && cfg->cpuinfo[0] != '\0' &&
-						!cJSON_GetObjectItemCaseSensitive(item, "cpuinfo")) {
-						if (!cJSON_AddStringToObject(item, "cpuinfo", cfg->cpuinfo)) {
-							cJSON_Delete(item);
-							return UPLOAD_RETRY;
-						}
-						modified = true;
-					}
-					if (modified) {
-						owned_payload = cJSON_PrintUnformatted(item);
-						if (!owned_payload) {
-							cJSON_Delete(item);
-							return UPLOAD_RETRY;
-						}
-						payload = owned_payload;
-						payload_len = strlen(owned_payload);
-					}
-				}
+	const char *payload = line;
+	size_t payload_len = line_len;
+	char *owned_payload = NULL;
+	if (cJSON_IsObject(item)) {
+		bool modified = false;
+		if (cfg->device_id && cfg->device_id[0] != '\0' &&
+			!cJSON_GetObjectItemCaseSensitive(item, "device_id")) {
+			if (!cJSON_AddStringToObject(item, "device_id", cfg->device_id)) {
 				cJSON_Delete(item);
-
-				long code = 0;
-				upload_result_t rc = http_post_with_retries(cfg, payload, payload_len, &code);
-				if (owned_payload) cJSON_free(owned_payload);
-				if (rc != UPLOAD_OK) return rc;
-				sent++;
+				return UPLOAD_RETRY;
 			}
-			start = i + 1;
+			modified = true;
+		}
+		if (cfg->cpuinfo && cfg->cpuinfo[0] != '\0' &&
+			!cJSON_GetObjectItemCaseSensitive(item, "cpuinfo")) {
+			if (!cJSON_AddStringToObject(item, "cpuinfo", cfg->cpuinfo)) {
+				cJSON_Delete(item);
+				return UPLOAD_RETRY;
+			}
+			modified = true;
+		}
+		if (modified) {
+			owned_payload = cJSON_PrintUnformatted(item);
+			if (!owned_payload) {
+				cJSON_Delete(item);
+				return UPLOAD_RETRY;
+			}
+			payload = owned_payload;
+			payload_len = strlen(owned_payload);
 		}
 	}
-	(void)sent;
-	return UPLOAD_OK;
+	cJSON_Delete(item);
+
+	long code = 0;
+	upload_result_t rc = http_post_with_retries(cfg, payload, payload_len, &code);
+	if (owned_payload) cJSON_free(owned_payload);
+	return rc;
+}
+
+static upload_result_t upload_json_stream(FILE *f, const cfg_t *cfg) {
+	char *line = NULL;
+	size_t line_cap = 0;
+	upload_result_t rc = UPLOAD_OK;
+
+	if (!f || !cfg) return UPLOAD_RETRY;
+
+	while (1) {
+		errno = 0;
+		ssize_t n = getline(&line, &line_cap, f);
+		if (n < 0) {
+			if (feof(f)) break;
+			rc = UPLOAD_RETRY;
+			break;
+		}
+
+		size_t line_start = 0;
+		size_t line_len = (size_t)n;
+		while (line_len > 0 && (line[line_start] == ' ' || line[line_start] == '\t')) {
+			line_start++;
+			line_len--;
+		}
+		while (line_len > 0) {
+			char c = line[line_start + line_len - 1];
+			if (c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+				line_len--;
+			} else {
+				break;
+			}
+		}
+
+		if (line_len == 0) continue;
+
+		rc = upload_json_line(cfg, line + line_start, line_len);
+		if (rc != UPLOAD_OK) break;
+
+		if (line_cap > HTTP_STREAM_LINE_BUFFER_SHRINK_THRESHOLD &&
+			line_len < (HTTP_STREAM_LINE_BUFFER_SHRINK_THRESHOLD / 4u)) {
+			release_large_line_buffer(&line, &line_cap);
+		}
+	}
+
+	free(line);
+	return rc;
 }
 
 static int http_post_json(const cfg_t *cfg, const char *payload, size_t len, long *out_code) {
@@ -1064,18 +1096,8 @@ static upload_result_t upload_file(const cfg_t *cfg, const file_item_t *item) {
 		return UPLOAD_BAD;
 	}
 
-	size_t len = (size_t)st.st_size;
-	char *file_buf = (char *)malloc(len + 1u);
-	if (!file_buf) { fclose(f); return UPLOAD_RETRY; }
-	if (len > 0) {
-		size_t rd = fread(file_buf, 1, len, f);
-		if (rd != len) { free(file_buf); fclose(f); return UPLOAD_RETRY; }
-	}
-	file_buf[len] = '\0';
+	upload_result_t rc = upload_json_stream(f, cfg);
 	fclose(f);
-
-	upload_result_t rc = upload_json_lines(cfg, file_buf, len);
-	free(file_buf);
 	return rc;
 }
 

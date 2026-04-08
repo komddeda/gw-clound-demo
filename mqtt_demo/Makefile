@@ -4,11 +4,13 @@ SYSROOT       := /work/yx_prj/rk3506/rk3506_linux6.1_sdk/buildroot/output/rockch
 CC      := $(CROSS_COMPILE)gcc
 CFLAGS  := --sysroot=$(SYSROOT) \
            -I$(SYSROOT)/usr/include \
-           -O2 -Wall
+           -Os -Wall \
+           -ffunction-sections -fdata-sections
 
 PAHO_SO := $(notdir $(firstword $(wildcard $(SYSROOT)/usr/lib/libpaho-mqtt3c.so*)))
 LDFLAGS := --sysroot=$(SYSROOT) \
            -L$(SYSROOT)/usr/lib \
+           -Wl,--gc-sections \
            -l:$(PAHO_SO) \
            -lpthread
 
