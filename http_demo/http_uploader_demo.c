@@ -98,6 +98,7 @@ typedef struct {
 	const char *cpuinfo;
 	const char *bad_dir;
 	const char *log_path;
+	const char *state_path;
 	int interval_s;
 	int http_timeout_ms;
 	int http_retries;
@@ -113,6 +114,7 @@ typedef struct {
 	double test_step;
 	char bad_dir_buf[PATH_MAX];
 	char log_path_buf[PATH_MAX];
+	char state_path_buf[PATH_MAX];
 	char cpuinfo_buf[128];
 	char dir_buf[PATH_MAX];
 	char url_buf[512];
@@ -121,8 +123,15 @@ typedef struct {
 } cfg_t;
 
 typedef struct {
+	bool valid;
+	time_t ts;
+	unsigned long seq;
+} file_order_t;
+
+typedef struct {
 	char path[PATH_MAX];
-	time_t mtime;
+	time_t write_mtime;
+	file_order_t order;
 	size_t size;
 } file_item_t;
 
@@ -145,6 +154,7 @@ static void cfg_defaults(cfg_t *cfg) {
 	cfg->cpuinfo = NULL;
 	cfg->bad_dir = NULL;
 	cfg->log_path = NULL;
+	cfg->state_path = NULL;
 	cfg->interval_s = 5;
 	cfg->http_timeout_ms = 5000;
 	cfg->http_retries = 3;
@@ -161,48 +171,13 @@ static void cfg_defaults(cfg_t *cfg) {
 	snprintf(cfg->test_value, sizeof(cfg->test_value), "%s", "0");
 }
 
-static const char *k_done_file_name = ".sent_files";
+static const char *k_default_done_path = "/var/log/http_uploader_demo.sent";
 
 typedef struct {
-	char **items;
-	size_t count;
-	size_t cap;
-} str_list_t;
-
-static void str_list_free(str_list_t *list) {
-	if (!list) return;
-	for (size_t i = 0; i < list->count; i++) {
-		free(list->items[i]);
-	}
-	free(list->items);
-	list->items = NULL;
-	list->count = 0;
-	list->cap = 0;
-}
-
-static bool str_list_contains(const str_list_t *list, const char *s) {
-	if (!list || !s) return false;
-	for (size_t i = 0; i < list->count; i++) {
-		if (strcmp(list->items[i], s) == 0) return true;
-	}
-	return false;
-}
-
-static int str_list_add(str_list_t *list, const char *s) {
-	if (!list || !s || !*s) return -1;
-	if (str_list_contains(list, s)) return 0;
-	if (list->count == list->cap) {
-		size_t ncap = (list->cap == 0) ? 16 : list->cap * 2;
-		char **tmp = (char **)realloc(list->items, ncap * sizeof(char *));
-		if (!tmp) return -1;
-		list->items = tmp;
-		list->cap = ncap;
-	}
-	list->items[list->count] = strdup(s);
-	if (!list->items[list->count]) return -1;
-	list->count++;
-	return 0;
-}
+	bool valid;
+	file_order_t order;
+	char last_name[PATH_MAX];
+} sent_state_t;
 
 static void trim_newline(char *s) {
 	if (!s) return;
@@ -213,30 +188,19 @@ static void trim_newline(char *s) {
 	}
 }
 
-static int load_done_list(const char *path, str_list_t *done) {
-	FILE *fp = fopen(path, "r");
-	if (!fp) return 0;
-	char line[256];
-	while (fgets(line, sizeof(line), fp) != NULL) {
-		trim_newline(line);
-		if (line[0] == '\0') continue;
-		if (str_list_add(done, line) != 0) {
-			fclose(fp);
-			return -1;
-		}
-	}
-	fclose(fp);
-	return 0;
-}
+static int mkdir_p(const char *path);
+static void join_path(char *dst, size_t cap, const char *dir, const char *name);
 
-static int append_done_list(const char *path, const char *name) {
-	FILE *fp = fopen(path, "a");
-	if (!fp) return -1;
-	fprintf(fp, "%s\n", name);
-	fflush(fp);
-	fsync(fileno(fp));
-	fclose(fp);
-	return 0;
+static int ensure_parent_dir(const char *path) {
+	if (!path || !*path) return -1;
+	char dirbuf[PATH_MAX];
+	strncpy(dirbuf, path, sizeof(dirbuf) - 1);
+	dirbuf[sizeof(dirbuf) - 1] = '\0';
+	char *slash = strrchr(dirbuf, '/');
+	if (!slash) return 0;
+	*slash = '\0';
+	if (dirbuf[0] == '\0') return 0;
+	return mkdir_p(dirbuf);
 }
 
 typedef enum {
@@ -258,7 +222,7 @@ static void usage(const char *argv0) {
 	fprintf(stderr,
 			"Usage: %s [--config PATH] --dir PATH --url URL [--interval-s N] [--http-timeout-ms N] [--http-retries N]\n"
 			"       [--device-id STR] [--max-file-kb N] [--max-total-kb N] [--stable-age-s N]\n"
-			"       [--bad-dir PATH] [--log PATH] [--http-insecure] [--http-backoff-ms N]\n"
+			"       [--bad-dir PATH] [--log PATH] [--state-file PATH] [--http-insecure] [--http-backoff-ms N]\n"
 			"       [--test-mode] [--test-type int|float|bool|string|json]\n"
 			"       [--test-pattern fixed|inc|dec] [--test-value VALUE] [--test-step N]\n"
 			"       [--test-interval-s N]\n",
@@ -388,6 +352,12 @@ static int http_apply_config_entry(const char *section,
 		if (demo_config_name_eq(key, "log") || demo_config_name_eq(key, "log_path")) {
 			snprintf(cfg->log_path_buf, sizeof(cfg->log_path_buf), "%s", value);
 			cfg->log_path = cfg->log_path_buf;
+			return 0;
+		}
+		if (demo_config_name_eq(key, "state") || demo_config_name_eq(key, "state_file") ||
+			demo_config_name_eq(key, "done_file") || demo_config_name_eq(key, "sent_file")) {
+			snprintf(cfg->state_path_buf, sizeof(cfg->state_path_buf), "%s", value);
+			cfg->state_path = cfg->state_path_buf;
 			return 0;
 		}
 		if (demo_config_name_eq(key, "http_insecure")) {
@@ -544,11 +514,23 @@ static double normalize_test_step(double step) {
 	return step < 0.0 ? -step : step;
 }
 
+static const char *path_basename(const char *path);
+static bool parse_data_file_basename_order(const char *name, file_order_t *out);
+static bool init_file_order(const char *name, time_t fallback_ts, file_order_t *out);
+static int compare_file_order(const file_order_t *a, const char *a_name,
+							  const file_order_t *b, const char *b_name);
+
 static int cmp_file_item(const void *a, const void *b) {
 	const file_item_t *fa = (const file_item_t *)a;
 	const file_item_t *fb = (const file_item_t *)b;
-	if (fa->mtime < fb->mtime) return -1;
-	if (fa->mtime > fb->mtime) return 1;
+	int rc = compare_file_order(&fa->order, path_basename(fa->path), &fb->order, path_basename(fb->path));
+	if (rc != 0) return rc;
+	if (fa->write_mtime < fb->write_mtime) return -1;
+	if (fa->write_mtime > fb->write_mtime) return 1;
+	const char *na = path_basename(fa->path);
+	const char *nb = path_basename(fb->path);
+	rc = strcmp(na, nb);
+	if (rc != 0) return rc;
 	return strcmp(fa->path, fb->path);
 }
 
@@ -613,6 +595,164 @@ static const char *path_basename(const char *path) {
 	return p ? p + 1 : path;
 }
 
+static bool parse_data_file_basename_order(const char *name, file_order_t *out) {
+	if (!name || !*name || !out) return false;
+	int year = 0, mon = 0, day = 0, hour = 0, min = 0, sec = 0;
+	unsigned long seq = 0;
+	int matched = sscanf(name, "data_%4d%2d%2d_%2d%2d%2d_%lu",
+		&year, &mon, &day, &hour, &min, &sec, &seq);
+	if (matched < 7) return false;
+
+	struct tm tm_value;
+	memset(&tm_value, 0, sizeof(tm_value));
+	tm_value.tm_year = year - 1900;
+	tm_value.tm_mon = mon - 1;
+	tm_value.tm_mday = day;
+	tm_value.tm_hour = hour;
+	tm_value.tm_min = min;
+	tm_value.tm_sec = sec;
+	tm_value.tm_isdst = -1;
+
+	time_t t = mktime(&tm_value);
+	if (t == (time_t)-1) return false;
+	out->valid = true;
+	out->ts = t;
+	out->seq = seq;
+	return true;
+}
+
+static bool init_file_order(const char *name, time_t fallback_ts, file_order_t *out) {
+	if (!out) return false;
+	memset(out, 0, sizeof(*out));
+	if (parse_data_file_basename_order(name, out)) {
+		return true;
+	}
+	if (fallback_ts != 0) {
+		out->valid = true;
+		out->ts = fallback_ts;
+		out->seq = 0;
+		return true;
+	}
+	return false;
+}
+
+static int compare_file_order(const file_order_t *a, const char *a_name,
+							  const file_order_t *b, const char *b_name) {
+	const bool a_valid = (a && a->valid);
+	const bool b_valid = (b && b->valid);
+	if (a_valid && b_valid) {
+		if (a->ts < b->ts) return -1;
+		if (a->ts > b->ts) return 1;
+		if (a->seq < b->seq) return -1;
+		if (a->seq > b->seq) return 1;
+	}
+	if (a_valid != b_valid) return a_valid ? 1 : -1;
+	return strcmp(a_name ? a_name : "", b_name ? b_name : "");
+}
+
+static bool resolve_sent_state_order(const cfg_t *cfg, const char *name,
+									 time_t fallback_ts, file_order_t *out) {
+	if (!name || !*name || !out) return false;
+	if (init_file_order(name, fallback_ts, out)) return true;
+	if (!cfg || !cfg->dir) return false;
+	char path[PATH_MAX];
+	join_path(path, sizeof(path), cfg->dir, name);
+	struct stat st;
+	if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+		return init_file_order(name, st.st_mtime, out);
+	}
+	return false;
+}
+
+static int load_sent_state(const cfg_t *cfg, sent_state_t *state) {
+	if (!state) return -1;
+	memset(state, 0, sizeof(*state));
+	if (!cfg || !cfg->state_path || !cfg->state_path[0]) return -1;
+
+	FILE *fp = fopen(cfg->state_path, "r");
+	if (!fp) return 0;
+
+	char line[PATH_MAX + 64];
+	char last_nonempty[PATH_MAX + 64];
+	last_nonempty[0] = '\0';
+	while (fgets(line, sizeof(line), fp) != NULL) {
+		trim_newline(line);
+		if (line[0] == '\0') continue;
+		snprintf(last_nonempty, sizeof(last_nonempty), "%s", line);
+	}
+	fclose(fp);
+	if (last_nonempty[0] == '\0') return 0;
+
+	char state_line[PATH_MAX + 64];
+	snprintf(state_line, sizeof(state_line), "%s", last_nonempty);
+	char *tab = strchr(state_line, '\t');
+	if (tab) {
+		*tab = '\0';
+		char *end = NULL;
+		errno = 0;
+		long long saved_ts = strtoll(state_line, &end, 10);
+		if (errno == 0 && end && *end == '\0' && tab[1] != '\0') {
+			snprintf(state->last_name, sizeof(state->last_name), "%s", tab + 1);
+			trim_newline(state->last_name);
+			if (!resolve_sent_state_order(cfg, state->last_name, (time_t)saved_ts, &state->order)) {
+				return -1;
+			}
+			state->valid = true;
+			LOGI("sent-state loaded: %s order_ts=%lld seq=%lu",
+				 state->last_name, (long long)state->order.ts, state->order.seq);
+			return 0;
+		}
+	}
+
+	const char *name = strstr(last_nonempty, "data_");
+	if (!name) name = last_nonempty;
+	while (*name == ' ' || *name == '\t') name++;
+	if (*name == '\0') return -1;
+
+	snprintf(state->last_name, sizeof(state->last_name), "%s", name);
+	trim_newline(state->last_name);
+	if (!resolve_sent_state_order(cfg, state->last_name, 0, &state->order)) {
+		return -1;
+	}
+	state->valid = true;
+	LOGI("legacy sent-state loaded: %s order_ts=%lld seq=%lu",
+		 state->last_name, (long long)state->order.ts, state->order.seq);
+	return 0;
+}
+
+static int save_sent_state(const cfg_t *cfg, const sent_state_t *state) {
+	if (!cfg || !cfg->state_path || !cfg->state_path[0] || !state || !state->valid) return -1;
+	if (ensure_parent_dir(cfg->state_path) != 0) return -1;
+
+	FILE *fp = fopen(cfg->state_path, "w");
+	if (!fp) return -1;
+	fprintf(fp, "%lld\t%s\n", (long long)state->order.ts, state->last_name);
+	fflush(fp);
+	fsync(fileno(fp));
+	fclose(fp);
+	LOGI("sent-state saved: %s order_ts=%lld seq=%lu",
+		 state->last_name, (long long)state->order.ts, state->order.seq);
+	return 0;
+}
+
+static int compare_item_to_sent_state(const file_item_t *item, const sent_state_t *state) {
+	if (!item) return -1;
+	if (!state || !state->valid) return 1;
+	return compare_file_order(&item->order, path_basename(item->path), &state->order, state->last_name);
+}
+
+static bool is_item_after_sent_state(const file_item_t *item, const sent_state_t *state) {
+	return compare_item_to_sent_state(item, state) > 0;
+}
+
+static void advance_sent_state(sent_state_t *state, const file_item_t *item) {
+	if (!state || !item) return;
+	if (!item->order.valid) return;
+	state->valid = true;
+	state->order = item->order;
+	snprintf(state->last_name, sizeof(state->last_name), "%s", path_basename(item->path));
+}
+
 static int list_log_files(const char *dir, file_item_t **out_items, size_t *out_count, size_t *out_total_bytes) {
 	DIR *d = opendir(dir);
 	if (!d) return -1;
@@ -637,7 +777,8 @@ static int list_log_files(const char *dir, file_item_t **out_items, size_t *out_
 			items = tmp;
 		}
 		strncpy(items[count].path, path, sizeof(items[count].path) - 1);
-		items[count].mtime = st.st_mtime;
+		items[count].write_mtime = st.st_mtime;
+		(void)init_file_order(de->d_name, st.st_mtime, &items[count].order);
 		items[count].size = (size_t)st.st_size;
 		total += (size_t)st.st_size;
 		count++;
@@ -657,7 +798,7 @@ static int prune_old_files_if_needed(const cfg_t *cfg, const file_item_t *items,
 	if (total_bytes <= cfg->max_total_bytes) return 0;
 	if (count <= 1) return 0;
 
-	size_t keep_idx = count - 1; // list is sorted by mtime asc
+	size_t keep_idx = count - 1; // list is sorted by filename order asc, falling back to write time
 	for (size_t i = 0; i < count; i++) {
 		if (i == keep_idx) continue;
 		LOGW("purge old file (total %zu > %zu): %s", total_bytes, cfg->max_total_bytes, items[i].path);
@@ -693,8 +834,8 @@ static int move_to_bad(cfg_t *cfg, const char *path) {
 
 static bool is_file_stable(const cfg_t *cfg, const file_item_t *item, time_t now) {
 	if (cfg->stable_age_s <= 0) return true;
-	if (item->mtime == 0) return true;
-	return (now - item->mtime) >= cfg->stable_age_s;
+	if (item->write_mtime == 0) return true;
+	return (now - item->write_mtime) >= cfg->stable_age_s;
 }
 
 static upload_result_t upload_json_lines(const cfg_t *cfg, const char *file_buf, size_t len) {
@@ -957,67 +1098,68 @@ static int upload_once(cfg_t *cfg) {
 	}
 
 	LOGD("scan dir=%s files=%zu total_bytes=%zu", cfg->dir, count, total_bytes);
-	char done_path[PATH_MAX];
-	join_path(done_path, sizeof(done_path), cfg->dir, k_done_file_name);
-	str_list_t done = {0};
-	if (load_done_list(done_path, &done) != 0) {
-		LOGW("done list read failed: %s", done_path);
+	sent_state_t sent_state = {0};
+	if (load_sent_state(cfg, &sent_state) != 0) {
+		LOGW("sent-state read failed: %s", cfg->state_path);
 	}
 
 	size_t newest_idx = (count > 0) ? (count - 1) : 0;
 	if (count == 0) {
-		str_list_free(&done);
 		free(items);
 		return 0;
 	}
 
 	time_t now = time(NULL);
-	for (size_t i = 0; i < count; i++) {
-		if (items[i].path[0] == '\0') continue;
-		if (i == newest_idx) {
+	int had_retry = 0;
+	ssize_t candidate_idx = -1;
+	for (size_t i = count; i > 0; i--) {
+		size_t idx = i - 1;
+		if (items[idx].path[0] == '\0') continue;
+		if (idx == newest_idx) {
 			// Skip newest file to avoid uploading an actively appended file.
-			LOGD("skip newest file: %s", items[i].path);
+			LOGD("skip newest file: %s", items[idx].path);
 			continue;
 		}
-		if (items[i].size == 0) {
-			LOGD("empty file, skip: %s", items[i].path);
-			continue;
-		}
-		const char *base = path_basename(items[i].path);
-		if (str_list_contains(&done, base)) {
-			LOGD("already sent, skip: %s", items[i].path);
-			continue;
-		}
-		if (!is_file_stable(cfg, &items[i], now)) {
-			LOGD("file not stable yet: %s", items[i].path);
-			continue;
-		}
-
-		upload_result_t rc = upload_file(cfg, &items[i]);
-		if (rc == UPLOAD_OK) {
-			LOGD("uploaded: %s", items[i].path);
-			if (append_done_list(done_path, base) != 0) {
-				LOGW("mark sent failed: %s", base);
-			} else {
-				(void)str_list_add(&done, base);
-			}
-		} else if (rc == UPLOAD_BAD) {
-			LOGW("bad file: %s", items[i].path);
-			if (move_to_bad(cfg, items[i].path) != 0) {
-				LOGW("move to bad failed, deleting: %s", items[i].path);
-				(void)remove(items[i].path);
-			}
-		} else if (rc == UPLOAD_RETRY) {
-			LOGW("upload failed, will retry later: %s", items[i].path);
+		if (!is_item_after_sent_state(&items[idx], &sent_state)) {
 			break;
+		}
+		candidate_idx = (ssize_t)idx;
+		break;
+	}
+
+	if (candidate_idx >= 0) {
+		file_item_t *item = &items[(size_t)candidate_idx];
+		if (item->size == 0) {
+			LOGD("latest pending file is empty, wait: %s", item->path);
+		} else if (!is_file_stable(cfg, item, now)) {
+			LOGD("latest pending file not stable yet: %s", item->path);
 		} else {
-			continue;
+			upload_result_t rc = upload_file(cfg, item);
+			if (rc == UPLOAD_OK) {
+				LOGI("uploaded latest completed file: %s", item->path);
+				advance_sent_state(&sent_state, item);
+				if (save_sent_state(cfg, &sent_state) != 0) {
+					LOGW("sent-state save failed: %s", cfg->state_path);
+				}
+			} else if (rc == UPLOAD_BAD) {
+				LOGW("bad latest pending file: %s", item->path);
+				if (move_to_bad(cfg, item->path) != 0) {
+					LOGW("move to bad failed, deleting: %s", item->path);
+					(void)remove(item->path);
+				}
+				advance_sent_state(&sent_state, item);
+				if (save_sent_state(cfg, &sent_state) != 0) {
+					LOGW("sent-state save failed after bad file: %s", cfg->state_path);
+				}
+			} else if (rc == UPLOAD_RETRY) {
+				LOGW("latest pending file upload failed, will retry later: %s", item->path);
+				had_retry = 1;
+			}
 		}
 	}
 
-	str_list_free(&done);
 	free(items);
-	return 0;
+	return had_retry ? 1 : 0;
 }
 
 int main(int argc, char **argv) {
@@ -1056,6 +1198,7 @@ int main(int argc, char **argv) {
 		if (!strcmp(argv[i], "--stable-age-s") && i + 1 < argc) { cfg.stable_age_s = atoi(argv[++i]); continue; }
 		if (!strcmp(argv[i], "--bad-dir") && i + 1 < argc) { cfg.bad_dir = argv[++i]; continue; }
 		if (!strcmp(argv[i], "--log") && i + 1 < argc) { cfg.log_path = argv[++i]; continue; }
+		if (!strcmp(argv[i], "--state-file") && i + 1 < argc) { cfg.state_path = argv[++i]; continue; }
 		if (!strcmp(argv[i], "--http-insecure")) { cfg.http_insecure = true; continue; }
 		if (!strcmp(argv[i], "--test-mode")) { cfg.test_mode = true; continue; }
 		if (!strcmp(argv[i], "--test-type") && i + 1 < argc) { cfg.test_value_type = parse_test_value_type(argv[++i]); continue; }
@@ -1082,17 +1225,22 @@ int main(int argc, char **argv) {
 		cfg.bad_dir = cfg.bad_dir_buf;
 	}
 	if (cfg.log_path == NULL || cfg.log_path[0] == '\0') {
-		if (cfg.test_mode) {
-			snprintf(cfg.log_path_buf, sizeof(cfg.log_path_buf), "%s", "./http_uploader_test.log");
-		} else {
-			join_path(cfg.log_path_buf, sizeof(cfg.log_path_buf), cfg.dir, "http_uploader.log");
-		}
+		snprintf(cfg.log_path_buf, sizeof(cfg.log_path_buf), "%s", "/var/log/http_uploader_demo.log");
 		cfg.log_path = cfg.log_path_buf;
+	}
+	if (cfg.state_path == NULL || cfg.state_path[0] == '\0') {
+		snprintf(cfg.state_path_buf, sizeof(cfg.state_path_buf), "%s", k_default_done_path);
+		cfg.state_path = cfg.state_path_buf;
 	}
 	if (log_open(cfg.log_path) != 0) {
 		fprintf(stderr, "[W] failed to open log file: %s (%s)\n", cfg.log_path, strerror(errno));
 	} else {
 		LOGI("log file: %s", cfg.log_path);
+	}
+	if (ensure_parent_dir(cfg.state_path) != 0) {
+		LOGW("state file init failed: %s (%s)", cfg.state_path, strerror(errno));
+	} else {
+		LOGI("state file: %s", cfg.state_path);
 	}
 
 	if (read_cpuinfo_serial(cfg.cpuinfo_buf, sizeof(cfg.cpuinfo_buf))) {
@@ -1120,12 +1268,20 @@ int main(int argc, char **argv) {
 
 	test_value_state_t test_state = {0};
 	while (g_running) {
+		int loop_rc = 0;
 		if (cfg.test_mode) {
-			(void)send_test_payload_once(&cfg, &test_state);
-		} else if (upload_once(&cfg) != 0) {
-			LOGW("upload scan failed: %s", strerror(errno));
+			loop_rc = send_test_payload_once(&cfg, &test_state);
+		} else {
+			loop_rc = upload_once(&cfg);
+			if (loop_rc < 0) {
+				LOGW("upload scan failed: %s", strerror(errno));
+			}
 		}
+
 		int wait_seconds = cfg.test_mode ? cfg.test_interval_s : cfg.interval_s;
+		if (!cfg.test_mode && loop_rc > 0) {
+			wait_seconds = 1;
+		}
 		for (int i = 0; i < wait_seconds && g_running; i++) {
 			sleep(1);
 		}

@@ -39,6 +39,8 @@ typedef struct {
 typedef struct {
     double numeric_value;
     bool numeric_ready;
+    int decimal_places;
+    bool decimal_places_ready;
 } test_value_state_t;
 
 static long long round_to_long_long(double value) {
@@ -63,6 +65,47 @@ static double normalize_test_step(double step) {
     return step < 0.0 ? -step : step;
 }
 
+static int detect_decimal_places(const char *text) {
+    if (!text || !*text) return 0;
+
+    const char *dot = strchr(text, '.');
+    if (!dot) return 0;
+
+    const char *end = text + strlen(text);
+    const char *exp = strpbrk(dot + 1, "eE");
+    if (exp) end = exp;
+    while (end > dot + 1 && end[-1] == '0') {
+        end--;
+    }
+
+    int places = (int)(end - dot - 1);
+    if (places < 0) return 0;
+    if (places > 9) return 9;
+    return places;
+}
+
+static double decimal_scale(int places) {
+    double scale = 1.0;
+    while (places-- > 0) scale *= 10.0;
+    return scale;
+}
+
+static double quantize_decimal(double value, int places) {
+    if (places <= 0) return (double)round_to_long_long(value);
+    double scale = decimal_scale(places);
+    return (double)round_to_long_long(value * scale) / scale;
+}
+
+static int resolve_test_decimal_places(const app_cfg_t *cfg) {
+    if (!cfg) return 0;
+    int value_places = detect_decimal_places(cfg->test_value);
+
+    char step_text[64];
+    snprintf(step_text, sizeof(step_text), "%.9f", normalize_test_step(cfg->test_step));
+    int step_places = detect_decimal_places(step_text);
+    return value_places > step_places ? value_places : step_places;
+}
+
 static int add_test_value(cJSON *root, const app_cfg_t *cfg, test_value_state_t *state) {
     if (!root || !cfg || !state) return -1;
 
@@ -77,11 +120,20 @@ static int add_test_value(cJSON *root, const app_cfg_t *cfg, test_value_state_t 
             if (cfg->test_value_type == TEST_VALUE_INT) {
                 cJSON_AddNumberToObject(root, "data", (double)round_to_long_long(current));
             } else {
+                if (!state->decimal_places_ready) {
+                    state->decimal_places = resolve_test_decimal_places(cfg);
+                    state->decimal_places_ready = true;
+                }
+                current = quantize_decimal(current, state->decimal_places);
                 cJSON_AddNumberToObject(root, "data", current);
             }
             if (cfg->test_pattern != TEST_PATTERN_FIXED) {
                 double step = normalize_test_step(cfg->test_step);
-                state->numeric_value = current + (cfg->test_pattern == TEST_PATTERN_DEC ? -step : step);
+                double next = current + (cfg->test_pattern == TEST_PATTERN_DEC ? -step : step);
+                if (cfg->test_value_type == TEST_VALUE_FLOAT) {
+                    next = quantize_decimal(next, state->decimal_places);
+                }
+                state->numeric_value = next;
             }
             return 0;
         }
